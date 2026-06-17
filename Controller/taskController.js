@@ -85,9 +85,11 @@ const uploadAttachment = async (req, res) => {
     const { originalname, mimetype, buffer } = req.file;
 
     // Step 1: Upload the file to EspoCRM as an Attachment
+    // EspoCRM requires: name, type, size, role, relatedType, relatedId, field, contents (base64)
     const attachPayload = {
       name: originalname,
       type: mimetype,
+      size: buffer.length,
       role: "Attachment",
       relatedType: "Task",
       relatedId: taskId,
