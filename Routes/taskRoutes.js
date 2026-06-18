@@ -15,8 +15,8 @@ router.get("/", getAllTasks);
 // GET a single task by EspoCRM record ID  —  must come before /:username
 router.get("/id/:taskId", getTaskById);
 
-// GET all tasks for a specific user by assignedUserName (searches assignedUsersNames)
-router.get("/:username", getTasksByUser);
+// GET all tasks for a specific user by their EspoCRM user ID (exact, unique match)
+router.get("/user/:userId", getTasksByUser);
 
 // POST create a new task
 router.post("/", createTask);

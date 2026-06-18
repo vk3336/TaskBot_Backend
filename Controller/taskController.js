@@ -119,6 +119,11 @@ const uploadAttachment = async (req, res) => {
     const attachResponse = await espoClient.post("/Attachment", attachPayload);
     const attachment = attachResponse.data;
 
+    // Guard: EspoCRM must return an attachment ID — without it the link failed
+    if (!attachment?.id) {
+      throw new Error("EspoCRM did not return an attachment ID — the file may not have been linked to the task.");
+    }
+
     // Fetch updated task detail for the response
     const updatedResponse = await espoClient.get(`/Task/${taskId}`, {
       params: { select: FULL_SELECT },
@@ -197,27 +202,19 @@ const getTaskById = async (req, res) => {
   }
 };
 
-// GET /api/tasks/:username — fetch all tasks for a user by exact display name
+// GET /api/tasks/user/:userId — fetch all tasks for a user by their EspoCRM user ID
 const getTasksByUser = async (req, res) => {
   try {
-    const { username } = req.params;
-    const lowerUsername = username.toLowerCase();
+    const { userId } = req.params;
 
     const allTasks = await fetchAllTasksFromEspo();
 
-    // Fix #4: exact full-name match instead of partial includes()
-    // The frontend passes the exact name it received from the task list, so
-    // partial matching only risks returning the wrong person's tasks.
+    // Match by user ID — IDs are unique so this can never return the wrong person's tasks
     const result = allTasks
       .map(normaliseTask)
-      .filter((task) => {
-        const names = Object.values(task.assignedUsersNames || {}).map((n) =>
-          n.toLowerCase()
-        );
-        return names.some((n) => n === lowerUsername);
-      });
+      .filter((task) => (task.assignedUsersIds || []).includes(userId));
 
-    // Fix #5: empty result is a valid state (200), not a 404
+    // Empty result is a valid state (200), not a 404
     return res.status(200).json({
       success: true,
       total: result.length,
