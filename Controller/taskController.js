@@ -1,12 +1,6 @@
 const espoClient = require("../Utils/espoClient");
 
-// Helper: fetch a single task by ID and return its full detail
-const fetchTaskById = async (taskId) => {
-  const response = await espoClient.get(`/Task/${taskId}`);
-  return response.data;
-};
-
-// Helper: build a normalised task object from EspoCRM task detail
+// Helper: build a normalised task object from an EspoCRM task record
 const normaliseTask = (task) => ({
   id: task.id,
   name: task.name,
@@ -17,7 +11,6 @@ const normaliseTask = (task) => ({
   dateStartDate: task.dateStartDate || null,
   dateEndDate: task.dateEndDate || null,
   description: task.description || null,
-  // Use the multi-user arrays that EspoCRM actually returns
   assignedUsersIds: task.assignedUsersIds || [],
   assignedUsersNames: task.assignedUsersNames || {},
   attachmentsIds: task.attachmentsIds || [],
@@ -26,7 +19,35 @@ const normaliseTask = (task) => ({
   modifiedAt: task.modifiedAt || null,
 });
 
-// POST /api/tasks — create a new task in EspoCRM (supports multi-assignee + audio attachment)
+// Fix #1 + #2 + #3: fetch ALL tasks in paginated list calls with full fields.
+// No per-record fetches, no N+1, no silent data loss from allSettled.
+const FULL_SELECT = [
+  "id", "name", "status", "priority",
+  "dateStart", "dateEnd", "dateStartDate", "dateEndDate",
+  "description", "assignedUsersIds", "assignedUsersNames",
+  "attachmentsIds", "attachmentsNames", "createdAt", "modifiedAt",
+].join(",");
+
+const fetchAllTasksFromEspo = async () => {
+  const PAGE = 200;
+  let offset = 0;
+  let collected = [];
+
+  while (true) {
+    const response = await espoClient.get("/Task", {
+      params: { maxSize: PAGE, offset, select: FULL_SELECT },
+    });
+    const page = response.data?.list || [];
+    const total = response.data?.total ?? page.length;
+    collected = collected.concat(page);
+    offset += page.length;
+    if (offset >= total || page.length === 0) break;
+  }
+
+  return collected;
+};
+
+// POST /api/tasks — create a new task in EspoCRM
 const createTask = async (req, res) => {
   try {
     const raw = req.body;
@@ -36,7 +57,6 @@ const createTask = async (req, res) => {
       "name", "priority",
       "dateStartDate", "dateEndDate", "description",
       "parentId", "parentType", "accountId", "contactId",
-      // multi-user fields
       "assignedUsersIds", "assignedUsersNames",
     ];
 
@@ -84,8 +104,6 @@ const uploadAttachment = async (req, res) => {
 
     const { originalname, mimetype, buffer } = req.file;
 
-    // Step 1: Upload the file to EspoCRM as an Attachment
-    // EspoCRM requires: name, type, size, role, relatedType, relatedId, field, contents (base64)
     const attachPayload = {
       name: originalname,
       type: mimetype,
@@ -101,8 +119,10 @@ const uploadAttachment = async (req, res) => {
     const attachResponse = await espoClient.post("/Attachment", attachPayload);
     const attachment = attachResponse.data;
 
-    // Step 2: Fetch updated task to return current state
-    const updatedTask = await fetchTaskById(taskId);
+    // Fetch updated task detail for the response
+    const updatedResponse = await espoClient.get(`/Task/${taskId}`, {
+      params: { select: FULL_SELECT },
+    });
 
     return res.status(201).json({
       success: true,
@@ -112,7 +132,7 @@ const uploadAttachment = async (req, res) => {
         name: attachment.name,
         type: attachment.type,
       },
-      task: normaliseTask(updatedTask),
+      task: normaliseTask(updatedResponse.data),
     });
   } catch (error) {
     const status = error.response?.status || 500;
@@ -126,24 +146,13 @@ const uploadAttachment = async (req, res) => {
   }
 };
 
-// GET /api/tasks — fetch all tasks using direct GET /Task/:id per record
+// GET /api/tasks — fetch all assigned tasks
 const getAllTasks = async (req, res) => {
   try {
-    // First get a list of task IDs
-    const listResponse = await espoClient.get("/Task", {
-      params: { maxSize: 200, select: "id,name" },
-    });
+    const allTasks = await fetchAllTasksFromEspo();
 
-    const taskList = listResponse.data?.list || [];
-
-    // Fetch full detail for each task by ID (parallel)
-    const detailResults = await Promise.allSettled(
-      taskList.map((t) => fetchTaskById(t.id))
-    );
-
-    const result = detailResults
-      .filter((r) => r.status === "fulfilled")
-      .map((r) => normaliseTask(r.value))
+    const result = allTasks
+      .map(normaliseTask)
       .filter(
         (task) =>
           task.assignedUsersIds.length > 0 ||
@@ -170,10 +179,12 @@ const getAllTasks = async (req, res) => {
 const getTaskById = async (req, res) => {
   try {
     const { taskId } = req.params;
-    const task = await fetchTaskById(taskId);
+    const response = await espoClient.get(`/Task/${taskId}`, {
+      params: { select: FULL_SELECT },
+    });
     return res.status(200).json({
       success: true,
-      data: normaliseTask(task),
+      data: normaliseTask(response.data),
     });
   } catch (error) {
     const status = error.response?.status || 500;
@@ -186,43 +197,27 @@ const getTaskById = async (req, res) => {
   }
 };
 
-// GET /api/tasks/:username — fetch all tasks for a particular user name
+// GET /api/tasks/:username — fetch all tasks for a user by exact display name
 const getTasksByUser = async (req, res) => {
   try {
     const { username } = req.params;
+    const lowerUsername = username.toLowerCase();
 
-    const taskResponse = await espoClient.get("/Task", {
-      params: {
-        maxSize: 200,
-        select: "id,name",
-      },
-    });
+    const allTasks = await fetchAllTasksFromEspo();
 
-    const taskList = taskResponse.data?.list || [];
-
-    // Fetch full details in parallel
-    const detailResults = await Promise.allSettled(
-      taskList.map((t) => fetchTaskById(t.id))
-    );
-
-    const result = detailResults
-      .filter((r) => r.status === "fulfilled")
-      .map((r) => normaliseTask(r.value))
+    // Fix #4: exact full-name match instead of partial includes()
+    // The frontend passes the exact name it received from the task list, so
+    // partial matching only risks returning the wrong person's tasks.
+    const result = allTasks
+      .map(normaliseTask)
       .filter((task) => {
-        // Check if user name exists in assignedUsersNames map values
         const names = Object.values(task.assignedUsersNames || {}).map((n) =>
           n.toLowerCase()
         );
-        return names.some((n) => n.includes(username.toLowerCase()));
+        return names.some((n) => n === lowerUsername);
       });
 
-    if (result.length === 0) {
-      return res.status(404).json({
-        success: false,
-        message: `No tasks found for user "${username}"`,
-      });
-    }
-
+    // Fix #5: empty result is a valid state (200), not a 404
     return res.status(200).json({
       success: true,
       total: result.length,
