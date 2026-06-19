@@ -94,6 +94,15 @@ const createTask = async (req, res) => {
       return res.status(400).json({ success: false, message: "Task name is required" });
     }
 
+    // Reject tasks with no assigned user
+    if (!taskData.assignedUsersIds || taskData.assignedUsersIds.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Task must be assigned to at least one team member",
+        error: "assignedUsersIds is required",
+      });
+    }
+
     // Validate that all assigned user IDs actually exist in EspoCRM
     if (taskData.assignedUsersIds && taskData.assignedUsersIds.length > 0) {
       try {
