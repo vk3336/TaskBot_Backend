@@ -147,22 +147,41 @@ const uploadAttachment = async (req, res) => {
       return res.status(400).json({ success: false, message: "No file uploaded" });
     }
 
-    const { originalname, mimetype, buffer } = req.file;
+    const { originalname, buffer } = req.file;
+    // Force audio/mp3 — multer may see audio/mpeg which EspoCRM misclassifies as video/mpeg
+    const mimetype = 'audio/mp3';
 
+    // EspoCRM attachment payload — use parentType/parentId (the correct field names)
     const attachPayload = {
       name: originalname,
       type: mimetype,
       size: buffer.length,
       role: "Attachment",
-      relatedType: "Task",
-      relatedId: taskId,
+      parentType: "Task",
+      parentId: taskId,
       field: "attachments",
       contents: buffer.toString("base64"),
     };
 
-    console.log("Uploading attachment to EspoCRM for task:", taskId);
-    const attachResponse = await espoClient.post("/Attachment", attachPayload);
+    console.log("Uploading attachment to EspoCRM for task:", taskId, "| file:", originalname, "| size:", buffer.length, "| mime:", mimetype);
+
+    let attachResponse;
+    try {
+      attachResponse = await espoClient.post("/Attachment", attachPayload);
+    } catch (espoErr) {
+      const status = espoErr.response?.status;
+      const data = espoErr.response?.data;
+      console.error("EspoCRM /Attachment error:", status, JSON.stringify(data));
+      return res.status(status || 500).json({
+        success: false,
+        message: "EspoCRM rejected the attachment",
+        error: data?.message || espoErr.message,
+        detail: data,
+      });
+    }
+
     const attachment = attachResponse.data;
+    console.log("EspoCRM attachment response:", JSON.stringify(attachment));
 
     // Guard: EspoCRM must return an attachment ID — without it the link failed
     if (!attachment?.id) {
