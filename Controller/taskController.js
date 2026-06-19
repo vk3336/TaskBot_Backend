@@ -47,6 +47,29 @@ const fetchAllTasksFromEspo = async () => {
   return collected;
 };
 
+// Helper: validate that every ID in assignedUsersIds exists in EspoCRM
+const validateAssignedUserIds = async (ids) => {
+  if (!ids || ids.length === 0) return; // unassigned is fine
+
+  // Fetch all users once and check membership
+  const response = await espoClient.get("/User", {
+    params: { maxSize: 200, offset: 0, select: "id,name" },
+  });
+  const users = response.data?.list || [];
+  const validIds = new Set(users.map((u) => u.id));
+  const names = {};
+  users.forEach((u) => { names[u.id] = u.name; });
+
+  const invalid = ids.filter((id) => !validIds.has(id));
+  if (invalid.length > 0) {
+    const labels = invalid.join(", ");
+    throw Object.assign(
+      new Error(`Assigned user(s) not found in EspoCRM: ${labels}`),
+      { statusCode: 400 }
+    );
+  }
+};
+
 // POST /api/tasks — create a new task in EspoCRM
 const createTask = async (req, res) => {
   try {
@@ -69,6 +92,19 @@ const createTask = async (req, res) => {
 
     if (!taskData.name) {
       return res.status(400).json({ success: false, message: "Task name is required" });
+    }
+
+    // Validate that all assigned user IDs actually exist in EspoCRM
+    if (taskData.assignedUsersIds && taskData.assignedUsersIds.length > 0) {
+      try {
+        await validateAssignedUserIds(taskData.assignedUsersIds);
+      } catch (validationError) {
+        return res.status(400).json({
+          success: false,
+          message: validationError.message,
+          error: "Invalid assigned user(s)",
+        });
+      }
     }
 
     console.log("Sending to EspoCRM:", JSON.stringify(taskData, null, 2));
