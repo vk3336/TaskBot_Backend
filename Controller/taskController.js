@@ -11,6 +11,7 @@ const normaliseTask = (task) => ({
   dateStartDate: task.dateStartDate || null,
   dateEndDate: task.dateEndDate || null,
   description: task.description || null,
+  cMessage: task.cMessage || null,
   assignedUsersIds: task.assignedUsersIds || [],
   assignedUsersNames: task.assignedUsersNames || {},
   attachmentsIds: task.attachmentsIds || [],
@@ -24,7 +25,8 @@ const normaliseTask = (task) => ({
 const FULL_SELECT = [
   "id", "name", "status", "priority",
   "dateStart", "dateEnd", "dateStartDate", "dateEndDate",
-  "description", "assignedUsersIds", "assignedUsersNames",
+  "description", "cMessage",
+  "assignedUsersIds", "assignedUsersNames",
   "attachmentsIds", "attachmentsNames", "createdAt", "modifiedAt",
 ].join(",");
 
@@ -78,7 +80,7 @@ const createTask = async (req, res) => {
     const taskData = {};
     const allowedFields = [
       "name", "priority",
-      "dateStartDate", "dateEndDate", "description",
+      "dateStartDate", "dateEndDate", "description", "cMessage",
       "parentId", "parentType", "accountId", "contactId",
       "assignedUsersIds", "assignedUsersNames",
     ];
