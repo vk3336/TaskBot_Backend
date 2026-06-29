@@ -9,6 +9,8 @@ const FULL_SELECT = [
   "dateStart", "dateEnd", "dateStartDate", "dateEndDate",
   "description", "cMessage",
   "assignedUsersIds", "assignedUsersNames",
+  "accountId", "accountName",
+  "contactId", "contactName",
   "attachmentsIds", "attachmentsNames", "createdAt", "modifiedAt",
 ].join(",");
 
@@ -26,6 +28,10 @@ const normaliseTask = (task) => ({
   cMessage: task.cMessage || null,
   assignedUsersIds: task.assignedUsersIds || [],
   assignedUsersNames: task.assignedUsersNames || {},
+  accountId: task.accountId || null,
+  accountName: task.accountName || null,
+  contactId: task.contactId || null,
+  contactName: task.contactName || null,
   attachmentsIds: task.attachmentsIds || [],
   attachmentsNames: task.attachmentsNames || {},
   createdAt: task.createdAt || null,
