@@ -1,7 +1,7 @@
 const express = require("express");
 const multer = require("multer");
 const router = express.Router();
-const { createTask, getAllTasks, getTaskById, getTasksByUser, uploadAttachment } = require("../Controller/taskController");
+const { createTask, getAllTasks, getTaskById, getTasksByUser, uploadAttachment, getQueueStatus } = require("../Controller/taskController");
 
 // multer stores the file in memory so we can forward the buffer to EspoCRM
 const upload = multer({
@@ -11,6 +11,9 @@ const upload = multer({
 
 // GET all tasks (full detail fetched per record via GET /Task/:id)
 router.get("/", getAllTasks);
+
+// GET a background queue task creation status
+router.get("/queue-status/:jobId", getQueueStatus);
 
 // GET a single task by EspoCRM record ID  —  must come before /:username
 router.get("/id/:taskId", getTaskById);

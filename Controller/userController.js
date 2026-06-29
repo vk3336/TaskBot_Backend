@@ -1,4 +1,5 @@
 const espoClient = require("../Utils/espoClient");
+const cache = require("../Utils/cache");
 
 // Fix #3: paginate until all users are fetched — no silent 200-record cap
 const fetchAllUsers = async () => {
@@ -23,6 +24,18 @@ const fetchAllUsers = async () => {
 // GET /api/users — fetch all users (id + name only)
 const getAllUsers = async (_req, res) => {
   try {
+    const cacheKey = "users:all";
+    const cachedUsers = await cache.get(cacheKey);
+
+    if (cachedUsers) {
+      return res.status(200).json({
+        success: true,
+        total: cachedUsers.length,
+        data: cachedUsers,
+        cached: true,
+      });
+    }
+
     const users = await fetchAllUsers();
 
     const result = users.map((user) => ({
@@ -30,10 +43,14 @@ const getAllUsers = async (_req, res) => {
       name: user.name,
     }));
 
+    // Cache the users list for 10 minutes (600 seconds)
+    await cache.set(cacheKey, result, 600);
+
     return res.status(200).json({
       success: true,
       total: result.length,
       data: result,
+      cached: false,
     });
   } catch (error) {
     const status = error.response?.status || 500;
