@@ -1,7 +1,9 @@
 const espoClient = require("../Utils/espoClient");
 const cache = require("../Utils/cache");
 
-// Fix #3: paginate until all users are fetched — no silent 200-record cap
+const CACHE_TTL = 600; // 10 minutes
+
+// ─── Fetch all users (sequential pagination until exhausted) ─────────────────
 const fetchAllUsers = async () => {
   const PAGE = 200;
   let offset = 0;
@@ -9,7 +11,7 @@ const fetchAllUsers = async () => {
 
   while (true) {
     const response = await espoClient.get("/User", {
-      params: { maxSize: PAGE, offset },
+      params: { maxSize: PAGE, offset, select: "id,name" },
     });
     const page = response.data?.list || [];
     const total = response.data?.total ?? page.length;
@@ -21,36 +23,61 @@ const fetchAllUsers = async () => {
   return collected;
 };
 
-// GET /api/users — fetch all users (id + name only)
-const getAllUsers = async (_req, res) => {
+// ─── GET /api/users ──────────────────────────────────────────────────────────
+// Supports two modes:
+//   1. ?page=&limit=  → CRM-level pagination (fast, no full fetch)
+//   2. No query params → full cached list
+const getAllUsers = async (req, res) => {
   try {
-    const cacheKey = "users:all";
-    const cachedUsers = await cache.get(cacheKey);
+    const { page, limit } = req.query;
+    const isPaginated = page || limit;
 
-    if (cachedUsers) {
+    // ── Mode 1: Paginated — fetch only the requested page from CRM ──
+    if (isPaginated) {
+      const pageNum = Math.max(1, parseInt(page, 10) || 1);
+      const limitNum = Math.min(200, Math.max(1, parseInt(limit, 10) || 20));
+      const offset = (pageNum - 1) * limitNum;
+
+      const cacheKey = `users:page:${pageNum}:${limitNum}`;
+      let cached = await cache.get(cacheKey);
+
+      if (!cached) {
+        const response = await espoClient.get("/User", {
+          params: { maxSize: limitNum, offset, select: "id,name" },
+        });
+        const list = response.data?.list || [];
+        const total = response.data?.total ?? 0;
+        const users = list.map(({ id, name }) => ({ id, name }));
+
+        cached = { users, total, totalPages: Math.ceil(total / limitNum) };
+        await cache.set(cacheKey, cached, CACHE_TTL);
+      }
+
       return res.status(200).json({
         success: true,
-        total: cachedUsers.length,
-        data: cachedUsers,
-        cached: true,
+        page: pageNum,
+        limit: limitNum,
+        total: cached.total,
+        totalPages: cached.totalPages,
+        data: cached.users,
       });
     }
 
-    const users = await fetchAllUsers();
+    // ── Mode 2: Full list (cached) ──
+    const cacheKey = "users:all";
+    let users = await cache.get(cacheKey);
 
-    const result = users.map((user) => ({
-      id: user.id,
-      name: user.name,
-    }));
-
-    // Cache the users list for 10 minutes (600 seconds)
-    await cache.set(cacheKey, result, 600);
+    if (!users) {
+      console.log("Cache miss. Fetching all users from CRM...");
+      const all = await fetchAllUsers();
+      users = all.map(({ id, name }) => ({ id, name }));
+      await cache.set(cacheKey, users, CACHE_TTL);
+    }
 
     return res.status(200).json({
       success: true,
-      total: result.length,
-      data: result,
-      cached: false,
+      total: users.length,
+      data: users,
     });
   } catch (error) {
     const status = error.response?.status || 500;
@@ -63,4 +90,4 @@ const getAllUsers = async (_req, res) => {
   }
 };
 
-module.exports = { getAllUsers };
+module.exports = { getAllUsers, fetchAllUsers };

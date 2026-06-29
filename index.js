@@ -23,10 +23,8 @@ app.get("/", (req, res) => {
   res.json({ message: "Task Management API is running" });
 });
 
-// Fix #6: global error middleware — catches Multer errors (file too large, wrong type)
-// and any other unhandled errors, and always returns consistent JSON
+// Global error handler — catches Multer errors and unhandled throws
 app.use((err, req, res, _next) => {
-  // Multer file size limit exceeded
   if (err.code === "LIMIT_FILE_SIZE") {
     return res.status(413).json({
       success: false,
@@ -34,7 +32,6 @@ app.use((err, req, res, _next) => {
       error: err.message,
     });
   }
-  // Multer unexpected field or other multer errors
   if (err.name === "MulterError") {
     return res.status(400).json({
       success: false,
@@ -42,7 +39,6 @@ app.use((err, req, res, _next) => {
       error: err.message,
     });
   }
-  // Generic fallback
   console.error("Unhandled error:", err);
   return res.status(err.status || 500).json({
     success: false,
@@ -51,43 +47,108 @@ app.use((err, req, res, _next) => {
   });
 });
 
-const { getAllUsers } = require("./Controller/userController");
-const { getAllAccounts } = require("./Controller/accountController");
-const { getAllContacts } = require("./Controller/contactController");
-const { getAllTasks } = require("./Controller/taskController");
+// ─── Cache warm-up ────────────────────────────────────────────────────────────
+// Import raw fetch functions — NOT controllers — so warmup bypasses HTTP
+const cache = require("./Utils/cache");
+const { fetchAllUsers } = require("./Controller/userController");
+const { fetchAllAccounts } = require("./Controller/accountController");
+const { fetchAllContacts } = require("./Controller/contactController");
+const { fetchAllTasks } = require("./Controller/taskController");
+
+const normaliseTask = (task) => ({
+  id: task.id,
+  name: task.name,
+  status: task.status,
+  priority: task.priority || null,
+  dateStart: task.dateStart || null,
+  dateEnd: task.dateEnd || null,
+  dateStartDate: task.dateStartDate || null,
+  dateEndDate: task.dateEndDate || null,
+  description: task.description || null,
+  cMessage: task.cMessage || null,
+  assignedUsersIds: task.assignedUsersIds || [],
+  assignedUsersNames: task.assignedUsersNames || {},
+  attachmentsIds: task.attachmentsIds || [],
+  attachmentsNames: task.attachmentsNames || {},
+  createdAt: task.createdAt || null,
+  modifiedAt: task.modifiedAt || null,
+});
 
 const warmupCache = async () => {
   console.log("🔥 Starting background cache warm-up...");
-  const dummyRes = {
-    status: function() { return this; },
-    json: function() { return this; }
-  };
-  
-  try {
-    await Promise.all([
-      getAllUsers({ query: {} }, dummyRes).catch(e => console.error("User warm-up error:", e.message)),
-      getAllAccounts({ query: {} }, dummyRes).catch(e => console.error("Account warm-up error:", e.message)),
-      getAllContacts({ query: {} }, dummyRes).catch(e => console.error("Contact warm-up error:", e.message)),
-      getAllTasks({ query: {} }, dummyRes).catch(e => console.error("Task warm-up error:", e.message))
-    ]);
-    console.log("✅ Cache warm-up completed successfully!");
-  } catch (err) {
-    console.warn("⚠️ Cache warm-up completed with errors:", err.message);
-  }
+
+  // Wait until Redis is connected (or confirmed unavailable) before writing
+  // This prevents writing to in-memory only and then losing the data to Redis
+  await cache.waitUntilReady();
+  console.log(`📦 Cache backend: ${cache.isUsingRedis() ? "Redis" : "in-memory"}`);
+
+  const jobs = [
+    {
+      key: "users:all",
+      label: "Users",
+      fetch: fetchAllUsers,
+      transform: (list) => list.map(({ id, name }) => ({ id, name })),
+    },
+    {
+      key: "accounts:all",
+      label: "Accounts",
+      fetch: fetchAllAccounts,
+      transform: (list) => list.map(({ id, name }) => ({ id, name })),
+    },
+    {
+      key: "contacts:all",
+      label: "Contacts",
+      fetch: fetchAllContacts,
+      transform: (list) => list.map(({ id, name }) => ({ id, name })),
+    },
+    {
+      key: "tasks:all",
+      label: "Tasks",
+      fetch: fetchAllTasks,
+      transform: (list) =>
+        list
+          .map(normaliseTask)
+          .filter(
+            (t) => t.assignedUsersIds.length > 0 || Object.keys(t.assignedUsersNames).length > 0
+          ),
+    },
+  ];
+
+  // All four run concurrently; failures don't cancel others
+  await Promise.allSettled(
+    jobs.map(async ({ key, label, fetch, transform }) => {
+      try {
+        const existing = await cache.get(key);
+        if (existing) {
+          console.log(`⚡ ${label}: already cached (${existing.length} records), skipping.`);
+          return;
+        }
+        const raw = await fetch();
+        const data = transform(raw);
+        await cache.set(key, data, key === "tasks:all" ? 300 : 600);
+        console.log(`✅ ${label}: cached ${data.length} records.`);
+      } catch (err) {
+        console.error(`❌ ${label} warm-up failed:`, err.message);
+      }
+    })
+  );
+
+  console.log("🏁 Cache warm-up finished.");
 };
 
-// Fix #8: log PORT; handle EADDRINUSE so the process doesn't silently exit
+// ─── Server start ─────────────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 const server = app.listen(PORT, () => {
-  console.log(`Server running on port ${process.env.BASE_URL}`);
-  warmupCache();
+  console.log(`✅ Server running on port ${PORT} (${process.env.BASE_URL || "http://localhost:" + PORT})`);
+  // Non-blocking: server accepts requests immediately while cache warms in background
+  warmupCache().catch((err) => console.error("Warm-up crashed:", err.message));
 });
 
 server.on("error", (err) => {
   if (err.code === "EADDRINUSE") {
     console.error(
-      `\nPort ${PORT} is already in use. Another server is still running.\n` +
-        `Stop it first, then try again:\n` +
+      `\nPort ${PORT} is already in use.\n` +
+        `Stop the existing process first:\n` +
         `  netstat -ano | findstr :${PORT}\n` +
         `  taskkill /PID <pid> /F\n`
     );

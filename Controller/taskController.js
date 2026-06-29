@@ -2,7 +2,17 @@ const espoClient = require("../Utils/espoClient");
 const cache = require("../Utils/cache");
 const taskQueue = require("../Utils/queue");
 
-// Helper: build a normalised task object from an EspoCRM task record
+const CACHE_TTL = 300; // 5 minutes for tasks
+
+const FULL_SELECT = [
+  "id", "name", "status", "priority",
+  "dateStart", "dateEnd", "dateStartDate", "dateEndDate",
+  "description", "cMessage",
+  "assignedUsersIds", "assignedUsersNames",
+  "attachmentsIds", "attachmentsNames", "createdAt", "modifiedAt",
+].join(",");
+
+// ─── Normalise a raw EspoCRM task record ─────────────────────────────────────
 const normaliseTask = (task) => ({
   id: task.id,
   name: task.name,
@@ -22,15 +32,8 @@ const normaliseTask = (task) => ({
   modifiedAt: task.modifiedAt || null,
 });
 
-const FULL_SELECT = [
-  "id", "name", "status", "priority",
-  "dateStart", "dateEnd", "dateStartDate", "dateEndDate",
-  "description", "cMessage",
-  "assignedUsersIds", "assignedUsersNames",
-  "attachmentsIds", "attachmentsNames", "createdAt", "modifiedAt",
-].join(",");
-
-const fetchAllTasksFromEspo = async () => {
+// ─── Fetch ALL tasks (sequential pagination) — used by warmup ────────────────
+const fetchAllTasks = async () => {
   const PAGE = 200;
   let offset = 0;
   let collected = [];
@@ -49,41 +52,34 @@ const fetchAllTasksFromEspo = async () => {
   return collected;
 };
 
-// Helper: validate that every ID in assignedUsersIds exists in EspoCRM (using cache)
+// ─── Validate assigned user IDs exist in EspoCRM ────────────────────────────
 const validateAssignedUserIds = async (ids) => {
-  if (!ids || ids.length === 0) return; // unassigned is fine
+  if (!ids || ids.length === 0) return;
 
-  // Try to get users from cache first
   let users = await cache.get("users:all");
   if (!users) {
     console.log("Cache miss in user validation. Fetching from CRM...");
-    // Fallback to API and populate cache
     const response = await espoClient.get("/User", {
       params: { maxSize: 200, offset: 0, select: "id,name" },
     });
     users = (response.data?.list || []).map((u) => ({ id: u.id, name: u.name }));
-    await cache.set("users:all", users, 600); // 10 minutes cache
+    await cache.set("users:all", users, 600);
   }
 
   const validIds = new Set(users.map((u) => u.id));
-  const names = {};
-  users.forEach((u) => { names[u.id] = u.name; });
-
   const invalid = ids.filter((id) => !validIds.has(id));
   if (invalid.length > 0) {
-    const labels = invalid.join(", ");
     throw Object.assign(
-      new Error(`Assigned user(s) not found in EspoCRM: ${labels}`),
+      new Error(`Assigned user(s) not found in EspoCRM: ${invalid.join(", ")}`),
       { statusCode: 400 }
     );
   }
 };
 
-// POST /api/tasks — create a new task using the Queue
+// ─── POST /api/tasks — create a new task via the queue ───────────────────────
 const createTask = async (req, res) => {
   try {
     const raw = req.body;
-
     const taskData = {};
     const allowedFields = [
       "name", "priority",
@@ -94,16 +90,13 @@ const createTask = async (req, res) => {
 
     for (const field of allowedFields) {
       const val = raw[field];
-      if (val !== undefined && val !== null && val !== "") {
-        taskData[field] = val;
-      }
+      if (val !== undefined && val !== null && val !== "") taskData[field] = val;
     }
 
     if (!taskData.name) {
       return res.status(400).json({ success: false, message: "Task name is required" });
     }
 
-    // Reject tasks with no assigned user
     if (!taskData.assignedUsersIds || taskData.assignedUsersIds.length === 0) {
       return res.status(400).json({
         success: false,
@@ -112,25 +105,17 @@ const createTask = async (req, res) => {
       });
     }
 
-    // Validate that all assigned user IDs actually exist in EspoCRM
-    if (taskData.assignedUsersIds && taskData.assignedUsersIds.length > 0) {
-      try {
-        await validateAssignedUserIds(taskData.assignedUsersIds);
-      } catch (validationError) {
-        return res.status(400).json({
-          success: false,
-          message: validationError.message,
-          error: "Invalid assigned user(s)",
-        });
-      }
+    try {
+      await validateAssignedUserIds(taskData.assignedUsersIds);
+    } catch (validationError) {
+      return res.status(400).json({
+        success: false,
+        message: validationError.message,
+        error: "Invalid assigned user(s)",
+      });
     }
 
-    console.log("Enqueuing task creation:", JSON.stringify(taskData, null, 2));
-
-    // Enqueue the task creation request
     const jobId = await taskQueue.enqueue(taskData);
-
-    // Wait up to 4 seconds for the job to complete to preserve frontend expectations
     const job = await taskQueue.waitForJob(jobId, 4000);
 
     if (job.status === "completed") {
@@ -149,7 +134,6 @@ const createTask = async (req, res) => {
         jobId,
       });
     } else {
-      // Still queued or processing (timed out waiting)
       return res.status(202).json({
         success: true,
         message: "Task creation queued in background",
@@ -169,17 +153,14 @@ const createTask = async (req, res) => {
   }
 };
 
-// GET /api/tasks/queue-status/:jobId — check status of queued job
+// ─── GET /api/tasks/queue-status/:jobId ──────────────────────────────────────
 const getQueueStatus = async (req, res) => {
   try {
     const { jobId } = req.params;
     const job = await taskQueue.getJob(jobId);
 
     if (!job) {
-      return res.status(404).json({
-        success: false,
-        message: "Job not found",
-      });
+      return res.status(404).json({ success: false, message: "Job not found" });
     }
 
     return res.status(200).json({
@@ -200,7 +181,7 @@ const getQueueStatus = async (req, res) => {
   }
 };
 
-// POST /api/tasks/:id/attachment — upload audio/file and link to a task
+// ─── POST /api/tasks/:id/attachment ─────────────────────────────────────────
 const uploadAttachment = async (req, res) => {
   try {
     const { id: taskId } = req.params;
@@ -210,11 +191,10 @@ const uploadAttachment = async (req, res) => {
     }
 
     const { originalname, buffer } = req.file;
-    const mimetype = 'audio/mp3';
 
     const attachPayload = {
       name: originalname,
-      type: mimetype,
+      type: "audio/mp3",
       size: buffer.length,
       role: "Attachment",
       parentType: "Task",
@@ -223,15 +203,12 @@ const uploadAttachment = async (req, res) => {
       contents: buffer.toString("base64"),
     };
 
-    console.log("Uploading attachment to EspoCRM for task:", taskId, "| file:", originalname, "| size:", buffer.length);
-
     let attachResponse;
     try {
       attachResponse = await espoClient.post("/Attachment", attachPayload);
     } catch (espoErr) {
       const status = espoErr.response?.status;
       const data = espoErr.response?.data;
-      console.error("EspoCRM /Attachment error:", status, JSON.stringify(data));
       return res.status(status || 500).json({
         success: false,
         message: "EspoCRM rejected the attachment",
@@ -241,17 +218,13 @@ const uploadAttachment = async (req, res) => {
     }
 
     const attachment = attachResponse.data;
-    console.log("EspoCRM attachment response:", JSON.stringify(attachment));
-
     if (!attachment?.id) {
-      throw new Error("EspoCRM did not return an attachment ID — the file may not have been linked to the task.");
+      throw new Error("EspoCRM did not return an attachment ID.");
     }
 
-    // Invalidate the tasks cache since this modifies a task (adds attachment ID)
     await cache.del("tasks:all");
     await cache.delPattern("tasks:user:*");
 
-    // Fetch updated task detail for the response
     const updatedResponse = await espoClient.get(`/Task/${taskId}`, {
       params: { select: FULL_SELECT },
     });
@@ -259,17 +232,12 @@ const uploadAttachment = async (req, res) => {
     return res.status(201).json({
       success: true,
       message: "Attachment uploaded successfully",
-      attachment: {
-        id: attachment.id,
-        name: attachment.name,
-        type: attachment.type,
-      },
+      attachment: { id: attachment.id, name: attachment.name, type: attachment.type },
       task: normaliseTask(updatedResponse.data),
     });
   } catch (error) {
     const status = error.response?.status || 500;
     const message = error.response?.data?.message || error.message;
-    console.log("Attachment upload error:", status, JSON.stringify(error.response?.data));
     return res.status(status).json({
       success: false,
       message: "Failed to upload attachment",
@@ -278,61 +246,68 @@ const uploadAttachment = async (req, res) => {
   }
 };
 
-// Helper to paginate an array
-const paginateArray = (array, page, limit) => {
-  const pageNum = parseInt(page, 10) || 1;
-  const limitNum = parseInt(limit, 10) || 20;
-  const offset = (pageNum - 1) * limitNum;
-  
-  const paginatedItems = array.slice(offset, offset + limitNum);
-  const totalPages = Math.ceil(array.length / limitNum);
-
-  return {
-    page: pageNum,
-    limit: limitNum,
-    totalPages,
-    total: array.length,
-    data: paginatedItems,
-  };
-};
-
-// GET /api/tasks — fetch all assigned tasks with cache and pagination
+// ─── GET /api/tasks — fetch all assigned tasks with CRM-level pagination ─────
 const getAllTasks = async (req, res) => {
   try {
+    const { page, limit } = req.query;
+    const isPaginated = page || limit;
+
+    // ── Mode 1: Paginated — fetch only the requested page from CRM ──
+    if (isPaginated) {
+      const pageNum = Math.max(1, parseInt(page, 10) || 1);
+      const limitNum = Math.min(200, Math.max(1, parseInt(limit, 10) || 20));
+      const offset = (pageNum - 1) * limitNum;
+
+      const cacheKey = `tasks:page:${pageNum}:${limitNum}`;
+      let cached = await cache.get(cacheKey);
+
+      if (!cached) {
+        console.log(`Cache miss. Fetching tasks page ${pageNum} from CRM...`);
+        const response = await espoClient.get("/Task", {
+          params: { maxSize: limitNum, offset, select: FULL_SELECT },
+        });
+        const raw = response.data?.list || [];
+        const total = response.data?.total ?? 0;
+
+        const tasks = raw
+          .map(normaliseTask)
+          .filter(
+            (t) => t.assignedUsersIds.length > 0 || Object.keys(t.assignedUsersNames).length > 0
+          );
+
+        cached = { tasks, total, totalPages: Math.ceil(total / limitNum) };
+        await cache.set(cacheKey, cached, CACHE_TTL);
+      }
+
+      return res.status(200).json({
+        success: true,
+        page: pageNum,
+        limit: limitNum,
+        total: cached.total,
+        totalPages: cached.totalPages,
+        data: cached.tasks,
+      });
+    }
+
+    // ── Mode 2: Full list (cached) ──
     const cacheKey = "tasks:all";
     let tasks = await cache.get(cacheKey);
 
     if (!tasks) {
       console.log("Cache miss. Fetching all tasks from CRM...");
-      const allTasks = await fetchAllTasksFromEspo();
-
-      tasks = allTasks
+      const all = await fetchAllTasks();
+      tasks = all
         .map(normaliseTask)
         .filter(
-          (task) =>
-            task.assignedUsersIds.length > 0 ||
-            Object.keys(task.assignedUsersNames).length > 0
+          (t) => t.assignedUsersIds.length > 0 || Object.keys(t.assignedUsersNames).length > 0
         );
-
-      // Cache all tasks for 5 minutes (300 seconds)
-      await cache.set(cacheKey, tasks, 300);
-    }
-
-    const { page, limit } = req.query;
-    if (page || limit) {
-      const paginatedResult = paginateArray(tasks, page, limit);
-      return res.status(200).json({
-        success: true,
-        ...paginatedResult,
-        cached: true,
-      });
+      await cache.set(cacheKey, tasks, CACHE_TTL);
     }
 
     return res.status(200).json({
       success: true,
       total: tasks.length,
       data: tasks,
-      cached: true,
     });
   } catch (error) {
     const status = error.response?.status || 500;
@@ -345,25 +320,22 @@ const getAllTasks = async (req, res) => {
   }
 };
 
-// GET /api/tasks/id/:taskId — fetch a single task by its EspoCRM record ID
+// ─── GET /api/tasks/id/:taskId ───────────────────────────────────────────────
 const getTaskById = async (req, res) => {
   try {
     const { taskId } = req.params;
     const cacheKey = `task:${taskId}`;
-    
+
     let task = await cache.get(cacheKey);
     if (!task) {
       const response = await espoClient.get(`/Task/${taskId}`, {
         params: { select: FULL_SELECT },
       });
       task = normaliseTask(response.data);
-      await cache.set(cacheKey, task, 300); // cache single task for 5 minutes
+      await cache.set(cacheKey, task, CACHE_TTL);
     }
 
-    return res.status(200).json({
-      success: true,
-      data: task,
-    });
+    return res.status(200).json({ success: true, data: task });
   } catch (error) {
     const status = error.response?.status || 500;
     const message = error.response?.data?.message || error.message;
@@ -375,44 +347,45 @@ const getTaskById = async (req, res) => {
   }
 };
 
-// GET /api/tasks/user/:userId — fetch all tasks for a user by their EspoCRM user ID (with caching and pagination)
+// ─── GET /api/tasks/user/:userId — tasks for a specific user ─────────────────
 const getTasksByUser = async (req, res) => {
   try {
     const { userId } = req.params;
+    const { page, limit } = req.query;
     const cacheKey = `tasks:user:${userId}`;
 
     let userTasks = await cache.get(cacheKey);
 
     if (!userTasks) {
       console.log(`Cache miss. Fetching tasks for user ${userId}...`);
-      
-      // Get all tasks (which will load from cache if available, else fetch CRM)
       let allTasks = await cache.get("tasks:all");
       if (!allTasks) {
-        const fetchAll = await fetchAllTasksFromEspo();
-        allTasks = fetchAll
+        const all = await fetchAllTasks();
+        allTasks = all
           .map(normaliseTask)
           .filter(
-            (task) =>
-              task.assignedUsersIds.length > 0 ||
-              Object.keys(task.assignedUsersNames).length > 0
+            (t) => t.assignedUsersIds.length > 0 || Object.keys(t.assignedUsersNames).length > 0
           );
-        await cache.set("tasks:all", allTasks, 300);
+        await cache.set("tasks:all", allTasks, CACHE_TTL);
       }
-
-      userTasks = allTasks.filter((task) => (task.assignedUsersIds || []).includes(userId));
-      
-      // Cache this user's task list for 5 minutes
-      await cache.set(cacheKey, userTasks, 300);
+      userTasks = allTasks.filter((t) => (t.assignedUsersIds || []).includes(userId));
+      await cache.set(cacheKey, userTasks, CACHE_TTL);
     }
 
-    const { page, limit } = req.query;
+    // In-memory pagination on the already-filtered user task list
     if (page || limit) {
-      const paginatedResult = paginateArray(userTasks, page, limit);
+      const pageNum = Math.max(1, parseInt(page, 10) || 1);
+      const limitNum = Math.min(200, Math.max(1, parseInt(limit, 10) || 20));
+      const offset = (pageNum - 1) * limitNum;
+      const slice = userTasks.slice(offset, offset + limitNum);
+
       return res.status(200).json({
         success: true,
-        ...paginatedResult,
-        cached: true,
+        page: pageNum,
+        limit: limitNum,
+        total: userTasks.length,
+        totalPages: Math.ceil(userTasks.length / limitNum),
+        data: slice,
       });
     }
 
@@ -420,7 +393,6 @@ const getTasksByUser = async (req, res) => {
       success: true,
       total: userTasks.length,
       data: userTasks,
-      cached: true,
     });
   } catch (error) {
     const status = error.response?.status || 500;
@@ -433,4 +405,12 @@ const getTasksByUser = async (req, res) => {
   }
 };
 
-module.exports = { createTask, getAllTasks, getTaskById, getTasksByUser, uploadAttachment, getQueueStatus };
+module.exports = {
+  createTask,
+  getAllTasks,
+  getTaskById,
+  getTasksByUser,
+  uploadAttachment,
+  getQueueStatus,
+  fetchAllTasks,
+};
