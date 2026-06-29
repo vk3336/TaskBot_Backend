@@ -9,6 +9,7 @@ const FULL_SELECT = [
   "dateStart", "dateEnd", "dateStartDate", "dateEndDate",
   "description", "cMessage",
   "assignedUsersIds", "assignedUsersNames",
+  "parentType", "parentId", "parentName",
   "accountId", "accountName",
   "contactId", "contactName",
   "attachmentsIds", "attachmentsNames", "createdAt", "modifiedAt",
@@ -28,6 +29,9 @@ const normaliseTask = (task) => ({
   cMessage: task.cMessage || null,
   assignedUsersIds: task.assignedUsersIds || [],
   assignedUsersNames: task.assignedUsersNames || {},
+  parentType: task.parentType || null,
+  parentId: task.parentId || null,
+  parentName: task.parentName || null,
   accountId: task.accountId || null,
   accountName: task.accountName || null,
   contactId: task.contactId || null,
@@ -90,13 +94,30 @@ const createTask = async (req, res) => {
     const allowedFields = [
       "name", "priority",
       "dateStartDate", "dateEndDate", "description", "cMessage",
-      "parentId", "parentType", "accountId", "contactId",
       "assignedUsersIds", "assignedUsersNames",
     ];
 
     for (const field of allowedFields) {
       const val = raw[field];
       if (val !== undefined && val !== null && val !== "") taskData[field] = val;
+    }
+
+    // ── Resolve parentType / parentId from contactId / accountId ──────────
+    // EspoCRM Task uses a polymorphic "parent" field.
+    // contactId  → parentType=Contact  (also auto-inherits the contact's account)
+    // accountId  → parentType=Account  (no contact link)
+    // Both given → prefer Contact so both account+contact are captured
+    if (raw.contactId) {
+      taskData.parentType = "Contact";
+      taskData.parentId   = raw.contactId;
+    } else if (raw.accountId) {
+      taskData.parentType = "Account";
+      taskData.parentId   = raw.accountId;
+    }
+    // Allow caller to pass parentType/parentId directly too
+    if (!taskData.parentType && raw.parentType && raw.parentId) {
+      taskData.parentType = raw.parentType;
+      taskData.parentId   = raw.parentId;
     }
 
     if (!taskData.name) {
@@ -122,7 +143,7 @@ const createTask = async (req, res) => {
     }
 
     const jobId = await taskQueue.enqueue(taskData);
-    const job = await taskQueue.waitForJob(jobId, 4000);
+    const job   = await taskQueue.waitForJob(jobId, 4000);
 
     if (job.status === "completed") {
       return res.status(201).json({
@@ -149,7 +170,7 @@ const createTask = async (req, res) => {
       });
     }
   } catch (error) {
-    const status = error.response?.status || 500;
+    const status  = error.response?.status  || 500;
     const message = error.response?.data?.message || error.message;
     return res.status(status).json({
       success: false,

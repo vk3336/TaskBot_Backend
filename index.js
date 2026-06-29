@@ -68,6 +68,9 @@ const normaliseTask = (task) => ({
   cMessage: task.cMessage || null,
   assignedUsersIds: task.assignedUsersIds || [],
   assignedUsersNames: task.assignedUsersNames || {},
+  parentType: task.parentType || null,
+  parentId: task.parentId || null,
+  parentName: task.parentName || null,
   accountId: task.accountId || null,
   accountName: task.accountName || null,
   contactId: task.contactId || null,
@@ -103,7 +106,11 @@ const warmupCache = async () => {
       key: "contacts:all",
       label: "Contacts",
       fetch: fetchAllContacts,
-      transform: (list) => list.map(({ id, name }) => ({ id, name })),
+      transform: (list) => list.map(({ id, name, accountId, accountName }) => ({
+        id, name,
+        accountId: accountId || null,
+        accountName: accountName || null,
+      })),
     },
     {
       key: "tasks:all",
