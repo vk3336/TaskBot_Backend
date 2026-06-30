@@ -1,6 +1,9 @@
 const express = require("express");
 const router  = express.Router();
-const { getAllContacts, getContactById, createContact } = require("../Controller/contactController");
+const { getAllContacts, getContactById, createContact, searchContacts } = require("../Controller/contactController");
+
+// GET fuzzy-search contacts by name (voice-optimised) — must be before /:id
+router.get("/search", searchContacts);
 
 // GET all contacts (id + name + accountId + accountName)
 router.get("/", getAllContacts);

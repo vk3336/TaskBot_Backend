@@ -1,5 +1,6 @@
 const espoClient = require("../Utils/espoClient");
 const cache = require("../Utils/cache");
+const Fuse = require("fuse.js");
 
 const PAGE_SIZE = 200;
 const CACHE_TTL = 600; // 10 minutes
@@ -177,4 +178,56 @@ const createContact = async (req, res) => {
   }
 };
 
-module.exports = { getAllContacts, fetchAllContacts, getContactById, createContact };
+// ─── GET /api/contacts/search?q=<voice-text> ─────────────────────────────────
+// Fuzzy-searches contact names from the cached list.
+// Returns up to `limit` best matches (default 5) sorted by score.
+// Also returns accountId + accountName so the frontend can auto-fill the
+// account field when a contact is selected via voice.
+const searchContacts = async (req, res) => {
+  try {
+    const query = (req.query.q || "").trim();
+    const limit = Math.min(20, Math.max(1, parseInt(req.query.limit, 10) || 5));
+
+    if (!query) {
+      return res.status(400).json({ success: false, message: "Query parameter 'q' is required" });
+    }
+
+    // Pull from cache (warm-up already loaded these)
+    let contacts = await cache.get("contacts:all");
+    if (!contacts) {
+      console.log("Search: cache miss, fetching all contacts...");
+      const all = await fetchAllContacts();
+      contacts = all.map(normaliseContact);
+      await cache.set("contacts:all", contacts, CACHE_TTL);
+    }
+
+    // Fuse.js — same tuning as accounts, voice-optimised
+    const fuse = new Fuse(contacts, {
+      keys: ["name"],
+      threshold: 0.4,
+      distance: 200,
+      includeScore: true,
+      ignoreLocation: true,
+      useExtendedSearch: false,
+      minMatchCharLength: 2,
+    });
+
+    const results = fuse.search(query, { limit });
+
+    const data = results.map(({ item, score }) => ({
+      id:          item.id,
+      name:        item.name,
+      accountId:   item.accountId,
+      accountName: item.accountName,
+      score:       parseFloat((1 - score).toFixed(4)), // 0–1 confidence
+    }));
+
+    return res.status(200).json({ success: true, query, total: data.length, data });
+  } catch (error) {
+    const status  = error.response?.status  || 500;
+    const message = error.response?.data?.message || error.message;
+    return res.status(status).json({ success: false, message: "Failed to search contacts", error: message });
+  }
+};
+
+module.exports = { getAllContacts, fetchAllContacts, getContactById, createContact, searchContacts };

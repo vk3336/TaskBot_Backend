@@ -1,6 +1,9 @@
 const express = require("express");
 const router  = express.Router();
-const { getAllAccounts, getAccountById, createAccount } = require("../Controller/accountController");
+const { getAllAccounts, getAccountById, createAccount, searchAccounts } = require("../Controller/accountController");
+
+// GET fuzzy-search accounts by name (voice-optimised) — must be before /:id
+router.get("/search", searchAccounts);
 
 // GET all accounts (id + name)
 router.get("/", getAllAccounts);

@@ -1,5 +1,6 @@
 const espoClient = require("../Utils/espoClient");
 const cache = require("../Utils/cache");
+const Fuse = require("fuse.js");
 
 const PAGE_SIZE = 200;
 const CACHE_TTL = 600; // 10 minutes
@@ -143,4 +144,57 @@ const createAccount = async (req, res) => {
   }
 };
 
-module.exports = { getAllAccounts, fetchAllAccounts, getAccountById, createAccount };
+// ─── GET /api/accounts/search?q=<voice-text> ─────────────────────────────────
+// Fuzzy-searches account names from the cached list.
+// Returns up to `limit` best matches (default 5) sorted by score.
+// Uses Fuse.js so voice-transcribed near-matches ("acme corp" → "Acme Corp.")
+// and partial words still resolve correctly.
+const searchAccounts = async (req, res) => {
+  try {
+    const query = (req.query.q || "").trim();
+    const limit = Math.min(20, Math.max(1, parseInt(req.query.limit, 10) || 5));
+
+    if (!query) {
+      return res.status(400).json({ success: false, message: "Query parameter 'q' is required" });
+    }
+
+    // Pull from cache (warm-up already loaded these)
+    let accounts = await cache.get("accounts:all");
+    if (!accounts) {
+      console.log("Search: cache miss, fetching all accounts...");
+      const all = await fetchAllAccounts();
+      accounts = all.map(({ id, name }) => ({ id, name }));
+      await cache.set("accounts:all", accounts, CACHE_TTL);
+    }
+
+    // Fuse.js config tuned for voice recognition output:
+    // - low threshold (0.4) = must be reasonably close, no wild guesses
+    // - includeScore so we can return confidence to the frontend
+    // - tokenize + matchAllTokens helps "acme corp" match "Acme Corporation"
+    const fuse = new Fuse(accounts, {
+      keys: ["name"],
+      threshold: 0.4,
+      distance: 200,
+      includeScore: true,
+      ignoreLocation: true,
+      useExtendedSearch: false,
+      minMatchCharLength: 2,
+    });
+
+    const results = fuse.search(query, { limit });
+
+    const data = results.map(({ item, score }) => ({
+      id: item.id,
+      name: item.name,
+      score: parseFloat((1 - score).toFixed(4)), // convert to 0–1 confidence (1 = perfect)
+    }));
+
+    return res.status(200).json({ success: true, query, total: data.length, data });
+  } catch (error) {
+    const status  = error.response?.status  || 500;
+    const message = error.response?.data?.message || error.message;
+    return res.status(status).json({ success: false, message: "Failed to search accounts", error: message });
+  }
+};
+
+module.exports = { getAllAccounts, fetchAllAccounts, getAccountById, createAccount, searchAccounts };
